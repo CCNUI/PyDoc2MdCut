@@ -146,6 +146,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--env", type=Path, default=Path(".env"),
         help="指定 .env 文件路径（默认: ./.env）",
     )
+    parser.add_argument(
+        "--resume", type=Path, default=None,
+        help="从已存在的输出目录继续上次未完成的任务（读取 <dir>/.pause/）；"
+             "指定时忽略 --input/--output 与时间戳后缀，直接复用该目录。",
+    )
+    parser.add_argument(
+        "--no-resume-prompt", action="store_true",
+        help="--resume 模式下跳过「确认继续」交互（用于脚本批处理）",
+    )
     return parser
 
 
@@ -368,6 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     if _default_env_path.exists():
         _ld(dotenv_path=_default_env_path, override=False)
 
+    # ============================================================
+    # ---- 分支 A：--resume 模式 —— 跳过 input/output 解析与时间戳逻辑 ----
+    # ============================================================
+    if args.resume is not None:
+        return _run_resume_mode(args)
+
     # ---- 解析 input_dir：CLI > .env (INPUT_DIR) ----
     input_dir = args.input
     if input_dir is None:
@@ -477,10 +492,29 @@ def main(argv: list[str] | None = None) -> int:
         r.startswith("ctime_filter") for r in f.eligibility_reasons
     )]
 
+    # ---- 写 pause/resume 初始状态 + 安装信号处理器 ----
+    # （所有过滤已经做完，all_files 是完整的；此处一次性 dump 到磁盘）
+    import pause_state
+    from interrupt import InterruptManager
+    pause_state.init_session(cfg, all_files)
+    interrupt = InterruptManager()
+    interrupt.install()
+
     # 文件内容哈希（按需）— 用于元信息显示和 / 或查重
     if cfg.needs_content_hash:
         from hasher import compute_hashes
-        compute_hashes(cfg, scanned_files)
+        compute_hashes(cfg, scanned_files, interrupt=interrupt)
+        if interrupt.should_pause():
+            logger.warning("哈希计算阶段收到中断信号，跳过后续流程。")
+            return _on_interrupt_exit(
+                cfg, entries=[], all_files=all_files,
+                filtered_by_mtime=filtered_by_mtime,
+                filtered_by_size=filtered_by_size,
+                filtered_by_ext=filtered_by_ext,
+                filtered_by_ctime=filtered_by_ctime,
+                ocr_stats=OcrStats(), dup_report=None,
+                interrupt=interrupt,
+            )
 
     # 查重（按需）
     dup_report = None
@@ -517,8 +551,17 @@ def main(argv: list[str] | None = None) -> int:
     # 转换
     entries: list[FileEntry] = []
     ocr_stats = OcrStats()
+    interrupted = False
 
     for sf in tqdm(scanned_files, desc="转换中", unit="file"):
+        # 在每个文件开始前检查中断标志（不在 converter 内部中断，避免外部库脏写）
+        if interrupt.should_pause():
+            interrupted = True
+            logger.warning(
+                f"收到中断信号，停止转换。已完成 {len(entries)} / {len(scanned_files)} 个文件。"
+            )
+            break
+
         conv: BaseConverter | None = None
         if sf.kind == "unsupported":
             result = _convert_unsupported(sf)
@@ -573,12 +616,30 @@ def main(argv: list[str] | None = None) -> int:
                 "splitter 会在缺少 spool 时回落到 markdown 内存（可能导致内存升高）"
             )
 
+        # 追加 pause/resume 状态条目（确保 spool 已落盘后再记，避免数据不一致）
+        try:
+            pause_state.append_completed_entry(cfg, sf, result)
+        except Exception as e:
+            logger.debug(f"append pause entry 失败 {sf.rel_path}: {e}")
+
         if result.status == "failed":
             logger.warning(f"❌ 失败 {sf.rel_path}: {result.error}")
         elif result.status == "skipped":
             logger.info(f"🚫 跳过 {sf.rel_path}: {result.skip_reason}")
         else:
             logger.debug(f"✅ 成功 {sf.rel_path}")
+
+    # 中断分支：写 partial 报告并退出（保留 .pause 状态供 resume）
+    if interrupted:
+        return _on_interrupt_exit(
+            cfg, entries=entries, all_files=all_files,
+            filtered_by_mtime=filtered_by_mtime,
+            filtered_by_size=filtered_by_size,
+            filtered_by_ext=filtered_by_ext,
+            filtered_by_ctime=filtered_by_ctime,
+            ocr_stats=ocr_stats, dup_report=dup_report,
+            interrupt=interrupt,
+        )
 
     # 分卷写文件
     logger.info("开始合并 + 分卷 ...")
@@ -641,6 +702,11 @@ def main(argv: list[str] | None = None) -> int:
         + (f", mtime 过滤掉 {len(filtered_by_mtime)} 个" if filtered_by_mtime else "")
         + (f", ctime 过滤掉 {len(filtered_by_ctime)} 个" if filtered_by_ctime else "")
     )
+
+    # 正常完成 → 清理 .pause/ 状态
+    pause_state.update_session_status(cfg.output_dir, "completed")
+    pause_state.clear_pause_state(cfg.output_dir)
+    interrupt.uninstall()
     return 0
 
 
@@ -669,6 +735,401 @@ def _write_intermediate_index(
         )
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ============================================================
+# 中断 / 恢复辅助
+# ============================================================
+
+def _on_interrupt_exit(
+    cfg: AppConfig,
+    *,
+    entries: list,
+    all_files: list,
+    filtered_by_mtime: list,
+    filtered_by_size: list,
+    filtered_by_ext: list,
+    filtered_by_ctime: list,
+    ocr_stats,
+    dup_report,
+    interrupt,
+) -> int:
+    """中断分支统一收尾。
+
+    顺序：
+      1) 更新 session 状态为 'interrupted'（持久化）
+      2) 尝试写当前 partial 报告到 <output>/partial_export/（不动 spool）
+         - 用户在第二次 Ctrl+C 时会被 InterruptManager 强退（os._exit），
+           即便 partial 写到一半，原始 spool / .pause 也都还在 → 之后还能
+           用 export_partial_report.py 重新生成。
+      3) 返回 130（标准 SIGINT 退出码）
+    """
+    import pause_state
+    logger = logging.getLogger("convert")
+
+    pause_state.update_session_status(cfg.output_dir, "interrupted")
+
+    n_done = len(entries)
+    logger.warning(
+        f"[interrupt] 写入 partial 报告中... 已完成 {n_done} 个文件。"
+        f"若 1 分钟内未结束，可再按一次 Ctrl+C 立即强退；"
+        f"之后用 `python export_partial_report.py --output {cfg.output_dir}` 重新生成。"
+    )
+
+    if n_done == 0:
+        logger.warning("已完成的文件数为 0，跳过 partial 报告生成。")
+        _print_resume_hint(cfg.output_dir)
+        interrupt.uninstall()
+        return 130
+
+    # 写 partial 到 <output>/partial_export/，避免覆盖 resume 后的最终输出
+    partial_dir = cfg.output_dir / "partial_export"
+    partial_dir.mkdir(parents=True, exist_ok=True)
+
+    original_out = cfg.output_dir
+    object.__setattr__(cfg, "output_dir", partial_dir)
+    try:
+        # 屏蔽 splitter 的 spool 清理 —— 保留 spool 给 resume / export_partial 用
+        import splitter as _splitter_mod
+        _orig_cleanup = _splitter_mod._cleanup_spool
+        _splitter_mod._cleanup_spool = lambda _cfg: None
+        try:
+            volume_paths = split_and_write(
+                cfg, entries, dup_report=dup_report, all_files=all_files
+            )
+        finally:
+            _splitter_mod._cleanup_spool = _orig_cleanup
+
+        report_path = partial_dir / "conversion_report.md"
+        write_report(
+            cfg=cfg,
+            entries=entries,
+            volume_paths=volume_paths,
+            ocr_stats=ocr_stats,
+            report_path=report_path,
+            filtered_out=filtered_by_mtime,
+            filtered_by_size=filtered_by_size,
+            filtered_by_ext=filtered_by_ext,
+            filtered_by_ctime=filtered_by_ctime,
+            all_files=all_files,
+            dup_report=dup_report,
+        )
+        logger.info(f"[interrupt] partial 报告已写入: {report_path}")
+        logger.info(f"[interrupt] partial 分卷: {partial_dir} （{len(volume_paths)} 卷）")
+    except SystemExit:
+        # split_and_write 内部可能 SystemExit（如卷限额太小）
+        raise
+    except Exception as e:
+        logger.warning(
+            f"[interrupt] partial 报告写入失败（spool / pause 状态未损坏，可后续手动导出）："
+            f"{e.__class__.__name__}: {e}"
+        )
+    finally:
+        object.__setattr__(cfg, "output_dir", original_out)
+
+    _print_resume_hint(cfg.output_dir)
+    interrupt.uninstall()
+    return 130
+
+
+def _print_resume_hint(output_dir: Path) -> None:
+    """打印「如何继续 / 如何导出」的提示。"""
+    print(
+        "\n========== 中断已保存 ==========\n"
+        f"  输出目录: {output_dir}\n"
+        f"\n  继续上次任务：\n"
+        f"    python convert.py --resume {output_dir}\n"
+        f"\n  仅导出当前已转换部分的报告（不继续转换）：\n"
+        f"    python export_partial_report.py --output {output_dir}\n"
+        "================================\n",
+        flush=True,
+    )
+
+
+def _run_resume_mode(args) -> int:
+    """从 args.resume 指定的目录继续上次中断的任务。
+
+    与 main() 主流程的差异：
+      - 跳过 input/output 解析；output_dir = args.resume；input_dir 取自 session.json
+      - 不附加时间戳后缀（继续同一目录）
+      - 扫描阶段不再扫盘，直接从 scan_state.jsonl 还原 all_files
+      - 转换循环只处理 pending_files（eligible 中未完成的）
+      - 已完成的 FileEntry 从 entries.jsonl + spool 重建（不再重新转换）
+    """
+    import pause_state
+    from interrupt import InterruptManager
+
+    out_dir: Path = args.resume.resolve()
+    if not out_dir.exists() or not out_dir.is_dir():
+        print(f"[启动错误] --resume 指定的目录不存在: {out_dir}", file=sys.stderr)
+        return 2
+    if not pause_state.has_pause_state(out_dir):
+        print(
+            f"[启动错误] {out_dir} 下未找到 .pause 状态（{pause_state.pause_dir(out_dir)}）；"
+            "无法 resume。",
+            file=sys.stderr,
+        )
+        return 2
+
+    payload = pause_state.load_for_resume(out_dir)
+    print(pause_state.describe_resume_state(payload))
+
+    if not args.no_resume_prompt:
+        try:
+            ans = input("是否从上次进度继续？[Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans not in ("", "y", "yes"):
+            print("已取消 resume。")
+            return 0
+
+    sess = payload.session
+    input_dir = Path(sess.input_dir)
+    if not input_dir.exists():
+        print(
+            f"[启动错误] resume 时检测到原输入目录已不存在: {input_dir}\n"
+            f"  如只想导出当前已转换部分，请使用：\n"
+            f"    python export_partial_report.py --output {out_dir}\n",
+            file=sys.stderr,
+        )
+        return 2
+
+    # 加载配置：用 resume 目录作为 output（保证不再追加时间戳）
+    cfg = load_config(
+        input_dir=input_dir,
+        output_dir=out_dir,
+        cli_max_size_mb=args.max_size_mb,
+        cli_verbose=args.verbose,
+        cli_no_ocr=args.no_ocr,
+        cli_filter_mtime=args.filter_mtime,
+        cli_keep_intermediate=args.keep_intermediate,
+        cli_file_metadata=args.file_metadata,
+        cli_dedup=args.dedup,
+        cli_metadata_position=args.metadata_position,
+        env_path=args.env,
+    )
+    _setup_logging(cfg)
+    logger = logging.getLogger("convert.resume")
+    logger.info(f"[resume] 输入目录 = {input_dir}")
+    logger.info(f"[resume] 输出目录 = {out_dir}")
+    logger.info(
+        f"[resume] 已完成 {len(payload.completed_ids)} / "
+        f"待处理 {len(payload.pending_files)}（eligible 共 {len(payload.eligible_files)}）"
+    )
+    cfg.print_effective()
+
+    # 重新计算 filter 桶（用恢复出的 all_files）
+    all_files = payload.all_files
+    filtered_by_mtime = [f for f in all_files if not f.eligible and any(
+        r.startswith("mtime_filter") for r in f.eligibility_reasons
+    )]
+    filtered_by_size = [f for f in all_files if not f.eligible and any(
+        r.startswith("size_filter") for r in f.eligibility_reasons
+    )]
+    filtered_by_ext = [f for f in all_files if not f.eligible and any(
+        r.startswith("ext_filter") for r in f.eligibility_reasons
+    )]
+    filtered_by_ctime = [f for f in all_files if not f.eligible and any(
+        r.startswith("ctime_filter") for r in f.eligibility_reasons
+    )]
+
+    # 重建已完成 entries（result.markdown="", spool 路径就是上次存的）
+    sf_by_id = {sf.file_id: sf for sf in all_files}
+    entries: list[FileEntry] = []
+    for rec in payload.completed_records:
+        sf = sf_by_id.get(rec["file_id"])
+        if sf is None:
+            logger.warning(f"找不到 file_id={rec['file_id']} 对应的 ScannedFile，跳过")
+            continue
+        entries.append(pause_state.reconstruct_entry_from_record(rec, sf))
+
+    interrupt = InterruptManager()
+    interrupt.install()
+    pause_state.update_session_status(cfg.output_dir, "running")
+
+    # 哈希：仅对剩余 pending_files 中需要 hash 的算（已完成的 hash 不重算）
+    pending = payload.pending_files
+    if cfg.needs_content_hash and pending:
+        from hasher import compute_hashes
+        compute_hashes(cfg, pending, interrupt=interrupt)
+        if interrupt.should_pause():
+            logger.warning("[resume] 哈希计算阶段被中断，保留进度退出。")
+            return _on_interrupt_exit(
+                cfg, entries=entries, all_files=all_files,
+                filtered_by_mtime=filtered_by_mtime,
+                filtered_by_size=filtered_by_size,
+                filtered_by_ext=filtered_by_ext,
+                filtered_by_ctime=filtered_by_ctime,
+                ocr_stats=OcrStats(), dup_report=None,
+                interrupt=interrupt,
+            )
+
+    # 查重：只在所有文件都转完之后才有意义；resume 时一般也要重做（依赖 hash）
+    # 简化：只在没有 pending 时算 —— 否则等下次 resume 完才算
+    dup_report = None
+    if cfg.duplicate_detection_enabled and not pending:
+        from dedup import find_duplicates
+        # 用 eligible_files 全集（含已完成 + 已 hash）算查重
+        dup_report = find_duplicates(cfg, payload.eligible_files)
+
+    # 准备 OCR
+    ocr_client: BaiduOCRClient | None = None
+    if cfg.ocr_enabled and pending:
+        try:
+            ocr_client = BaiduOCRClient(
+                api_key=cfg.baidu_api_key,
+                secret_key=cfg.baidu_secret_key,
+                engine=cfg.ocr_engine,
+                max_retries=cfg.ocr_max_retries,
+                min_interval=cfg.ocr_min_interval,
+                token_cache_path=cfg.ocr_token_cache,
+                max_image_bytes=cfg.ocr_max_image_bytes,
+            )
+            logger.info(f"[resume] OCR 客户端就绪，引擎: {cfg.ocr_engine}")
+        except Exception as e:
+            logger.error(f"[resume] OCR 客户端初始化失败: {e}")
+            ocr_client = None
+
+    converters = _build_converter_map(cfg, ocr_client)
+
+    # 转换 pending 文件（与主循环逻辑一致）
+    ocr_stats = OcrStats()
+    interrupted = False
+    for sf in tqdm(pending, desc="转换中(resume)", unit="file"):
+        if interrupt.should_pause():
+            interrupted = True
+            logger.warning(
+                f"[resume] 收到中断信号，停止。本轮已完成 "
+                f"{sum(1 for e in entries if e.scanned.file_id not in payload.completed_ids)} 个文件。"
+            )
+            break
+
+        conv: BaseConverter | None = None
+        if sf.kind == "unsupported":
+            result = _convert_unsupported(sf)
+        else:
+            conv = converters.get(sf.kind)
+            if conv is None:
+                result = _convert_unsupported(sf)
+            else:
+                try:
+                    result = conv.convert(sf.path)
+                except Exception as e:
+                    logger.exception(f"转换 {sf.rel_path} 时发生未捕获异常")
+                    result = ConversionResult(
+                        status="failed",
+                        markdown="",
+                        error=f"未捕获异常 {e.__class__.__name__}: {e}",
+                    )
+
+        if sf.kind == "image" and result.status == "success":
+            ocr_stats.call_count += 1
+            ocr_stats.total_chars += int(result.extra.get("ocr_chars", 0) or 0)
+            ocr_stats.total_seconds += float(result.extra.get("ocr_elapsed", 0.0) or 0.0)
+
+        if (
+            sf.kind != "unsupported"
+            and conv is not None
+            and result.status == "success"
+        ):
+            try:
+                result = conv._post_convert_truncate(result, path=sf.path)
+            except Exception as e:
+                logger.warning(
+                    f"post-convert 截取异常（{sf.rel_path}）：{e.__class__.__name__}: {e}"
+                )
+
+        entries.append(FileEntry(scanned=sf, result=result))
+
+        if cfg.keep_intermediate:
+            _save_intermediate(cfg, sf, result)
+        try:
+            _spool_file_block(cfg, sf, result)
+        except Exception as e:
+            logger.warning(
+                f"写 spool 失败（{sf.rel_path}）：{e.__class__.__name__}: {e}"
+            )
+        try:
+            pause_state.append_completed_entry(cfg, sf, result)
+        except Exception as e:
+            logger.debug(f"append pause entry 失败 {sf.rel_path}: {e}")
+
+        if result.status == "failed":
+            logger.warning(f"❌ 失败 {sf.rel_path}: {result.error}")
+        elif result.status == "skipped":
+            logger.info(f"🚫 跳过 {sf.rel_path}: {result.skip_reason}")
+        else:
+            logger.debug(f"✅ 成功 {sf.rel_path}")
+
+    if interrupted:
+        return _on_interrupt_exit(
+            cfg, entries=entries, all_files=all_files,
+            filtered_by_mtime=filtered_by_mtime,
+            filtered_by_size=filtered_by_size,
+            filtered_by_ext=filtered_by_ext,
+            filtered_by_ctime=filtered_by_ctime,
+            ocr_stats=ocr_stats, dup_report=dup_report,
+            interrupt=interrupt,
+        )
+
+    # 全部完成 → 走正式 split + report，然后清理 .pause
+    logger.info("[resume] 开始合并 + 分卷 ...")
+    volume_paths = split_and_write(
+        cfg, entries, dup_report=dup_report, all_files=all_files
+    )
+    logger.info(f"[resume] 分卷完成：共 {len(volume_paths)} 卷")
+
+    report_path = cfg.output_dir / "conversion_report.md"
+    write_report(
+        cfg=cfg,
+        entries=entries,
+        volume_paths=volume_paths,
+        ocr_stats=ocr_stats,
+        report_path=report_path,
+        filtered_out=filtered_by_mtime,
+        filtered_by_size=filtered_by_size,
+        filtered_by_ext=filtered_by_ext,
+        filtered_by_ctime=filtered_by_ctime,
+        all_files=all_files,
+        dup_report=dup_report,
+    )
+    logger.info(f"[resume] 报告已生成: {report_path}")
+
+    try:
+        from rejected_tree import render_rejected_tree_markdown
+        rejected_tree_md = render_rejected_tree_markdown(
+            filtered_by_ext=filtered_by_ext,
+            filtered_by_size=filtered_by_size,
+            filtered_by_mtime=filtered_by_mtime,
+            filtered_by_ctime=filtered_by_ctime,
+            entries=entries,
+            input_dir_label=str(cfg.input_dir),
+        )
+        rejected_tree_path = cfg.output_dir / "rejected_tree.md"
+        rejected_tree_path.write_text(rejected_tree_md, encoding="utf-8")
+        logger.info(f"[resume] 被拒清单 tree 已生成: {rejected_tree_path}")
+    except Exception as e:
+        logger.warning(
+            f"生成 rejected_tree.md 失败（不影响主流程）: {e.__class__.__name__}: {e}"
+        )
+
+    if cfg.keep_intermediate:
+        index_path = cfg.intermediate_dir / "INDEX.md"
+        _write_intermediate_index(cfg, entries, index_path)
+        logger.info(f"[resume] 中间产物索引已生成: {index_path}")
+
+    n_ok = sum(1 for e in entries if e.result.status == "success")
+    n_fail = sum(1 for e in entries if e.result.status == "failed")
+    n_skip = sum(1 for e in entries if e.result.status == "skipped")
+    logger.info(
+        f"[resume] 完成：枚举 {len(all_files)}, 成功 {n_ok}, 失败 {n_fail}, "
+        f"跳过 {n_skip}, 共 {len(volume_paths)} 卷"
+    )
+
+    pause_state.update_session_status(cfg.output_dir, "completed")
+    pause_state.clear_pause_state(cfg.output_dir)
+    interrupt.uninstall()
+    return 0
 
 
 if __name__ == "__main__":

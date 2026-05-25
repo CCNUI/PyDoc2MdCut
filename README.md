@@ -456,7 +456,58 @@ out/
 
 ---
 
-## 注意事项 & 默认实现说明
+## 中断、恢复、与部分导出（v5.1 新增）
+
+### Ctrl+C 中断（暂停当前任务）
+
+转换运行中按 **Ctrl+C** 触发"软暂停"：
+
+1. 第一次 Ctrl+C：当前正在转换的文件会先收尾（不会立刻把进程砍掉），然后退出。
+   - 已转换的所有文件块都已落盘到 `<output>/.spool/` 与 `<output>/.pause/` 状态目录。
+   - 工具会尝试把"截至此刻的报告"写到 `<output>/partial_export/`。
+   - 默认 1 分钟内会结束 Python 进程。
+2. 如果某个超大文件正在转、1 分钟还没释放：**再按一次 Ctrl+C** —— 工具会直接
+   `os._exit(130)` 强制退出。即使强退，`.spool/` 和 `.pause/` 都不会丢，下次还能恢复。
+
+### 继续上次任务
+
+```
+python convert.py --resume ./out
+```
+
+- 必须传 `--resume <output_dir>`（注意是输出目录，不是输入目录）。
+- 启动时会读 `<output>/.pause/session.json`，打印上次进度并询问 `[Y/n]`。
+  脚本批处理可加 `--no-resume-prompt` 自动确认。
+- **不会重新扫盘**：使用上次扫描结果 `scan_state.jsonl`，保证文件 ID 一致。
+- **只转剩余 pending 文件**：已完成的从 spool 中复用，不重复消耗 OCR 配额。
+- 全部完成后会清掉 `.pause/`，写最终报告到 `<output>/conversion_report.md`。
+
+### 只导出当前缓存中的部分报告（不继续转换）
+
+万一原始输入目录已经搬走、不打算 resume，只想拿到"已转换部分"的合并 MD：
+
+```
+python export_partial_report.py --output ./out
+```
+
+- 读 `<output>/.pause/` + `<output>/.spool/`，写到 `<output>/partial_export/`。
+- **不动 `.spool/` 和 `.pause/`** —— 之后还能 `--resume` 继续转。
+- 没有 `.pause/` 时可加 `--from-spool-only` 兜底，纯按 spool 文件拼。
+
+### .pause/ 目录结构（调试用）
+
+```
+out/.pause/
+├── session.json         # 运行元数据 + 状态: running / interrupted / completed
+├── scan_state.jsonl     # 扫描快照：每行一个 ScannedFile (含 file_id, hash, eligible)
+└── entries.jsonl        # 转换日志：每行一条已完成记录 (status, warnings, spool_path...)
+```
+
+正常完成后 `.pause/` 会自动删除。
+
+---
+
+
 
 1. **图片型 PDF 不自动 OCR**：检测到后只发警告 + 在报告中列出。两条扩展路线写在
    `<故障排查>` 节末。

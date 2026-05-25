@@ -1,4 +1,7 @@
 """转换器集合。每种文件类型对应一个 converter。"""
+from .doc_converter import DocConverter
+from .xls_converter import XlsConverter
+from .ppt_converter import PptConverter
 from .base import BaseConverter, ConversionResult
 from .pdf_converter import PdfConverter
 from .docx_converter import DocxConverter
@@ -42,4 +45,7 @@ __all__ = [
     "ExeConverter",
     "ALL_ARCHIVE_KINDS",
     "make_archive_converter",
+    "DocConverter",
+    "XlsConverter",
+    "PptConverter",
 ]

@@ -44,8 +44,13 @@ def _hash_file(path: Path, algo: str) -> str:
     return h.hexdigest()
 
 
-def compute_hashes(cfg: AppConfig, files: list[ScannedFile]) -> None:
-    """就地填充 files 列表中每个 ScannedFile 的 content_hash。"""
+def compute_hashes(cfg: AppConfig, files: list[ScannedFile], *, interrupt=None) -> None:
+    """就地填充 files 列表中每个 ScannedFile 的 content_hash。
+
+    Args:
+        interrupt: 可选的 InterruptManager。每个文件之间会 check 一次；
+                   命中后立即停止后续文件，已算的保留。
+    """
     if not cfg.needs_content_hash:
         return
     if not files:
@@ -60,6 +65,14 @@ def compute_hashes(cfg: AppConfig, files: list[ScannedFile]) -> None:
 
     iterator = tqdm(files, desc=f"计算哈希({algo})", unit="file")
     for sf in iterator:
+        # 中断检查（文件粒度，避免在 read 中间打断）
+        if interrupt is not None and interrupt.should_pause():
+            logger.warning(
+                f"哈希计算收到中断信号，已算 {ok} / 跳过 {skipped_oversize} / 失败 {failed}，"
+                "剩余文件标记为未计算。"
+            )
+            break
+
         # 文件不存在 / 0 字节 / 元信息读取失败的兜底
         if sf.size_bytes == 0:
             try:
