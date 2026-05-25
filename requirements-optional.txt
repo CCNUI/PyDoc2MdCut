@@ -1,0 +1,8 @@
+# 可选依赖（按需安装）
+# 安装方式: pip install -r requirements-optional.txt
+
+# 解码 MAVLink .tlog 文件 → 可读消息列表
+pymavlink>=2.4.40
+
+# OCR 图片尺寸读取（不装也不报错，只是图片尺寸显示"未知"）
+Pillow>=10.0.0

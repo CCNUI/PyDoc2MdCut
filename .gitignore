@@ -1,0 +1,33 @@
+# 配置与凭据
+.env
+.baidu_token_cache.json
+*.token_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 日志与运行产物
+run.log
+*.log
+
+# 输出目录（按需）
+out/
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+Test1/
